@@ -1,0 +1,9 @@
+streamlit
+telethon
+qdrant-client
+numpy
+scikit-learn
+pydantic
+python-dotenv
+pytest
+huggingface_hub
