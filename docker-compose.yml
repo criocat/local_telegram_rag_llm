@@ -8,3 +8,37 @@ services:
       - "6334:6334"
     volumes:
       - ./qdrant_storage:/qdrant/storage
+
+  ingest:
+    build: .
+    container_name: telegram-rag-ingest
+    restart: unless-stopped
+    depends_on:
+      - qdrant
+    env_file:
+      - .env
+    environment:
+      - QDRANT_HOST=qdrant
+    volumes:
+      - .:/app
+    command: ["uv", "run", "python", "-m", "src.ingest", "--mode", "sync"]
+    stdin_open: true 
+    tty: true
+
+  app:
+    build: .
+    container_name: telegram-rag-app
+    restart: unless-stopped
+    depends_on:
+      - qdrant
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    environment:
+      - QDRANT_HOST=qdrant
+    volumes:
+      - ./models:/app/models
+      - ./data:/app/data
+      - ./qdrant_storage:/app/qdrant_storage
+    command: ["uv", "run", "python", "-m", "streamlit", "run", "src/app.py", "--server.port=8501", "--server.address=0.0.0.0"]

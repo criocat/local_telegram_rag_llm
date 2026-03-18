@@ -1,0 +1,7 @@
+models/
+data/
+.venv/
+__pycache__/
+.git/
+.cursor/
+qdrant_storage/

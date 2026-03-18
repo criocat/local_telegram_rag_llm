@@ -1,2 +1,2 @@
 #!/usr/bin/env bash
-python run_models.py
+python download_models.py

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import argparse
 import asyncio
+import click
 import hashlib
 import json
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -54,12 +55,14 @@ class Burst:
 
 
 def normalize_author(username: str | None, user_id: int) -> str:
+    """Format an author's name, defaulting to their user ID if no username is set."""
     if username:
         return f"@{username.lstrip('@')}"
     return f"@tg_{user_id}"
 
 
 def should_index_message(is_private: bool, sender_id: int | None, me_id: int, replied_to_sender_id: int | None) -> bool:
+    """Determine if a message should be indexed based on privacy and participant rules."""
     if is_private:
         return True
     if sender_id == me_id:
@@ -70,6 +73,7 @@ def should_index_message(is_private: bool, sender_id: int | None, me_id: int, re
 
 
 def merge_messages_into_bursts(messages: list[IndexedMessage]) -> list[Burst]:
+    """Group consecutive messages from the same sender into a single 'Burst' for better context."""
     if not messages:
         return []
     sorted_msgs = sorted(messages, key=lambda x: (x.timestamp, x.message_id))
@@ -122,78 +126,106 @@ def merge_messages_into_bursts(messages: list[IndexedMessage]) -> list[Burst]:
 
 class IngestState:
     def __init__(self, path: Path):
+        """Initialize the state tracker for storing the last read message IDs."""
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._state = {"chat_last_ids": {}}
         self.load()
 
     def load(self) -> None:
+        """Load the ingestion state from the JSON file."""
         if self.path.exists():
             self._state = json.loads(self.path.read_text(encoding="utf-8"))
 
     def save(self) -> None:
+        """Save the current ingestion state to the JSON file."""
         self.path.write_text(json.dumps(self._state, ensure_ascii=True, indent=2), encoding="utf-8")
 
     def get_last_id(self, chat_id: int) -> int:
+        """Retrieve the last processed message ID for a specific chat."""
         return int(self._state.get("chat_last_ids", {}).get(str(chat_id), 0))
 
     def set_last_id(self, chat_id: int, message_id: int) -> None:
+        """Update the last processed message ID for a specific chat."""
         self._state.setdefault("chat_last_ids", {})[str(chat_id)] = int(message_id)
 
 
 def point_id_for_burst(chat_id: int, message_ids: list[int]) -> str:
+    """Generate a deterministic, unique UUID for a Qdrant point based on chat and message IDs."""
     raw = f"{chat_id}:{','.join(str(m) for m in sorted(message_ids))}"
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+    hash_bytes = hashlib.md5(raw.encode("utf-8")).digest()
+    return str(uuid.UUID(bytes=hash_bytes))
 
 
 class TelegramIngestor:
     def __init__(self, settings: Settings, store: QdrantStore, llm: LlamaEngine, state: IngestState):
+        """Initialize the main orchestrator for fetching, parsing, and storing Telegram messages."""
         self.settings = settings
         self.store = store
         self.llm = llm
         self.state = state
 
-    async def run(self, mode: str) -> None:
+    async def run(self, mode: str, start_date: datetime | None = None) -> None:
+        """Start the ingestion process based on the requested mode (full, sync, full_then_sync)."""
         if mode not in {"full", "sync", "full_then_sync"}:
             raise ValueError("mode must be one of: full, sync, full_then_sync")
 
         if mode == "full":
-            await self._run_full()
+            await self._run_full(start_date)
             return
         if mode == "sync":
-            await self._run_sync()
+            await self._run_sync(start_date)
             return
-        await self._run_full()
-        await self._run_sync()
+        await self._run_full(start_date)
+        await self._run_sync(start_date)
 
-    async def _run_full(self) -> None:
+    async def _run_full(self, start_date: datetime | None = None) -> None:
+        """Perform a complete historical backfill of all available conversations."""
         client, me_id = await self._connect()
         try:
+            print("Starting full historical backfill...")
+            dialog_count = 0
             async for dialog in client.iter_dialogs():
                 await self._ingest_dialog(client, dialog, me_id, min_id=0)
             self.state.save()
+            print(f"Full historical backfill complete. Processed {dialog_count} dialogs.")
         finally:
             await client.disconnect()
 
-    async def _run_sync(self) -> None:
+    async def _run_sync(self, start_date: datetime | None = None) -> None:
+        """Catch up on missed messages since the last run, then listen for live updates."""
         client, me_id = await self._connect()
         try:
-            async for dialog in client.iter_dialogs():
+            print("Starting sync mode... checking for new messages since last run.")
+            # Get the total number of dialogs first for the progress tracker
+            dialogs = await client.get_dialogs(limit=None)
+            total_dialogs = len(dialogs)
+            print(f"Found {total_dialogs} dialogs to check.")
+            
+            for i, dialog in enumerate(dialogs, 1):
+                name = getattr(dialog, "name", None) or getattr(dialog.entity, "title", None) or "Unknown"
+                print(f"Checking dialog {i}/{total_dialogs}: {name}")
+                
                 min_id = self.state.get_last_id(dialog.id)
-                await self._ingest_dialog(client, dialog, me_id, min_id=min_id)
+                await self._ingest_dialog(client, dialog, me_id, min_id=min_id, start_date=start_date)
+                
             self.state.save()
+            print("Sync complete. Listening for live updates...")
             await self._run_live(client, me_id)
         finally:
             await client.disconnect()
 
     async def _run_live(self, client: Any, me_id: int) -> None:
+        """Listen to real-time incoming messages and immediately ingest them."""
         from telethon import events
 
         @client.on(events.NewMessage())
         async def handler(event: Any) -> None:
+            dialog_name = getattr(event.chat, "title", None) or "private"
+            
             indexed = await self._extract_indexed_messages(
                 client=client,
-                dialog_name=getattr(event.chat, "title", None) or "private",
+                dialog_name=dialog_name,
                 chat_id=event.chat_id,
                 is_private=bool(event.is_private),
                 message=event.message,
@@ -201,6 +233,9 @@ class TelegramIngestor:
             )
             if not indexed:
                 return
+                
+            print(f"[Live] New message ingested from '{dialog_name}' (ID: {event.message.id})")
+            
             await self._index_messages(indexed)
             self.state.set_last_id(int(event.chat_id), int(event.message.id))
             self.state.save()
@@ -208,6 +243,7 @@ class TelegramIngestor:
         await client.run_until_disconnected()
 
     async def _connect(self) -> tuple[Any, int]:
+        """Authenticate and establish a connection to the Telegram API."""
         from telethon import TelegramClient
 
         if not self.settings.telegram_api_id or not self.settings.telegram_api_hash:
@@ -222,18 +258,31 @@ class TelegramIngestor:
         me = await client.get_me()
         return client, int(me.id)
 
-    async def _ingest_dialog(self, client: Any, dialog: Any, me_id: int, min_id: int) -> None:
+    async def _ingest_dialog(self, client: Any, dialog: Any, me_id: int, min_id: int, start_date: datetime | None = None) -> None:
+        """Fetch and process all messages within a specific chat starting from min_id."""
         chat_id = int(dialog.id)
         chat_name = getattr(dialog, "name", None) or getattr(dialog.entity, "title", None) or "unknown_chat"
         is_private = bool(getattr(dialog, "is_user", False))
 
         indexed_messages: list[IndexedMessage] = []
         max_seen_message_id = min_id
+        
+        kwargs = {"reverse": True, "min_id": min_id}
+        if start_date and min_id == 0:
+            kwargs["offset_date"] = start_date
 
-        async for message in client.iter_messages(dialog.entity, reverse=True, min_id=min_id):
+        async for message in client.iter_messages(dialog.entity, **kwargs):
             if not getattr(message, "message", None):
                 continue
             max_seen_message_id = max(max_seen_message_id, int(message.id))
+            
+            # Fast path: Skip processing entirely if we only want our own messages
+            # and this message is from someone else in a non-private chat
+            if not is_private:
+                sender_id = int(getattr(message, "sender_id", 0) or 0)
+                if sender_id != me_id and not getattr(message, "reply_to_msg_id", None):
+                    continue
+                    
             extracted = await self._extract_indexed_messages(
                 client=client,
                 dialog_name=chat_name,
@@ -242,7 +291,9 @@ class TelegramIngestor:
                 message=message,
                 me_id=me_id,
             )
-            indexed_messages.extend(extracted)
+            if extracted:
+                print(f"[Sync] Ingested message from '{chat_name}' (ID: {message.id})")
+                indexed_messages.extend(extracted)
 
         await self._index_messages(indexed_messages)
         if max_seen_message_id > 0:
@@ -257,6 +308,7 @@ class TelegramIngestor:
         message: Any,
         me_id: int,
     ) -> list[IndexedMessage]:
+        """Convert a raw Telethon message object into structured IndexedMessage items."""
         sender_id = int(getattr(message, "sender_id", 0) or 0)
         sender = await message.get_sender()
         username = getattr(sender, "username", None) if sender else None
@@ -321,6 +373,7 @@ class TelegramIngestor:
         return [item for item in items if item.text]
 
     async def _index_messages(self, indexed_messages: list[IndexedMessage]) -> None:
+        """Embed and upload a batch of prepared messages into the Qdrant vector database."""
         if not indexed_messages:
             return
         bursts = merge_messages_into_bursts(indexed_messages)
@@ -349,26 +402,35 @@ class TelegramIngestor:
         self.store.upsert_points(points)
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Ingest Telegram messages into Qdrant")
-    parser.add_argument(
-        "--mode",
-        default="sync",
-        choices=["full", "sync", "full_then_sync"],
-        help="Ingestion mode",
-    )
-    return parser.parse_args()
-
-
-async def _main() -> None:
-    args = parse_args()
+async def run_ingest(mode: str, start_date: datetime | None = None) -> None:
+    """Initialize necessary services and execute the main ingestion runner."""
     settings = load_settings()
     store = create_store(settings)
     llm = LlamaEngine(settings)
     state = IngestState(settings.ingest_state_path)
     ingestor = TelegramIngestor(settings=settings, store=store, llm=llm, state=state)
-    await ingestor.run(args.mode)
+    await ingestor.run(mode, start_date=start_date)
+
+
+@click.command(help="Ingest Telegram messages into Qdrant")
+@click.option(
+    "--mode",
+    type=click.Choice(["full", "sync", "full_then_sync"]),
+    default="sync",
+    help="Ingestion mode",
+)
+@click.option(
+    "--start-date",
+    type=str,
+    default=None,
+    help="Only ingest messages newer than this date (format: YYYY-MM-DD)",
+)
+def _main(mode: str, start_date: str | None) -> None:
+    dt = None
+    if start_date:
+        dt = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    asyncio.run(run_ingest(mode, dt))
 
 
 if __name__ == "__main__":
-    asyncio.run(_main())
+    _main()

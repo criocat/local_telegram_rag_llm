@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import argparse
 import subprocess
 import sys
 
+import click
 
-def _run_compose_up() -> None:
+
+def _run_qdrant() -> None:
     commands = [
         ["docker", "compose", "up", "-d", "qdrant"],
         ["docker-compose", "up", "-d", "qdrant"],
@@ -18,21 +19,27 @@ def _run_compose_up() -> None:
     raise RuntimeError("Failed to start Qdrant. Install Docker Compose and run Docker Desktop.")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Start backend services")
-    parser.add_argument(
-        "--ingest-mode",
-        choices=["full", "sync", "full_then_sync", "none"],
-        default="sync",
-        help="Which ingestion mode to run after Qdrant starts",
-    )
-    args = parser.parse_args()
-
-    _run_compose_up()
+@click.command(help="Start backend services")
+@click.option(
+    "--ingest-mode",
+    type=click.Choice(["full", "sync", "full_then_sync", "none"]),
+    default="sync",
+    help="Which ingestion mode to run after Qdrant starts",
+)
+@click.option(
+    "--start-date",
+    type=str,
+    default=None,
+    help="Only ingest messages newer than this date (format: YYYY-MM-DD)",
+)
+def main(ingest_mode: str, start_date: str | None) -> None:
+    _run_qdrant()
     print("Qdrant is up.")
 
-    if args.ingest_mode != "none":
-        cmd = [sys.executable, "-m", "src.ingest", "--mode", args.ingest_mode]
+    if ingest_mode != "none":
+        cmd = [sys.executable, "-m", "src.ingest", "--mode", ingest_mode]
+        if start_date:
+            cmd.extend(["--start-date", start_date])
         subprocess.run(cmd, check=True)
 
 

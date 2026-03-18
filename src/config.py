@@ -22,6 +22,7 @@ class Settings:
     llama_n_ctx: int
     llama_n_threads: int
     llama_n_batch: int
+    llama_n_gpu_layers: int
     ingest_state_path: Path
 
 
@@ -51,5 +52,6 @@ def load_settings() -> Settings:
         llama_n_ctx=int(_env("LLAMA_N_CTX", "8192")),
         llama_n_threads=int(_env("LLAMA_N_THREADS", "8")),
         llama_n_batch=int(_env("LLAMA_N_BATCH", "256")),
+        llama_n_gpu_layers=int(_env("LLAMA_N_GPU_LAYERS", "0")), # Set to 0 by default for CPU-only systems
         ingest_state_path=(base_dir / _env("INGEST_STATE_PATH", "./data/ingest_state.json")).resolve(),
     )

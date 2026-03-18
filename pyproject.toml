@@ -1,0 +1,29 @@
+[project]
+name = "local-telegram-rag-llm"
+version = "0.1.0"
+description = "Local RAG app for Telegram history with Qdrant, Telethon, Streamlit and llama-cpp."
+readme = "README.md"
+requires-python = "==3.12.*"
+dependencies = [
+    "streamlit",
+    "telethon",
+    "qdrant-client",
+    "numpy",
+    "scikit-learn",
+    "pydantic",
+    "python-dotenv",
+    "pytest",
+    "huggingface_hub",
+    "llama-cpp-python",
+    "click",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

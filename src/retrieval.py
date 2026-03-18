@@ -34,12 +34,18 @@ class RetrievalEngine:
         self.store = store
         self.llm = llm
 
-    def retrieve(self, question: str) -> RetrievalResult:
-        router = self.llm.route_query(question)
+    def retrieve(self, question: str, chat_history: list[dict] | None = None) -> RetrievalResult:
+        router = self.llm.route_query(question, chat_history=chat_history)
+        
+        # Fast path: skip RAG completely if the LLM router decides it's not needed
+        if not router.requires_history:
+            return RetrievalResult(router=router, top_chunks=[], expanded_context="")
+            
         vector = self.llm.embed_text(router.search_query)
         query_filter = self._build_filter(router.filters)
         candidates = self.store.search(vector=vector, query_filter=query_filter, limit=30, with_payload=True)
-        re_ranked = self._apply_mmr(query_vector=vector, candidates=candidates, lambda_param=0.6, top_k=5)
+        re_ranked = self._apply_mmr(query_vector=vector, candidates=candidates, lambda_param=0.6, top_k=10)
+        re_ranked.sort(key=lambda x: x.score, reverse=True)
         expanded = self._expand_context(re_ranked)
         return RetrievalResult(router=router, top_chunks=re_ranked, expanded_context=expanded)
 
